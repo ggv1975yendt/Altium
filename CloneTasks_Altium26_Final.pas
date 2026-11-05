@@ -1,15 +1,20 @@
 { CloneTasks.pas - Altium Designer DelphiScript
   Entry point: RunCloneTasks
+  Built-in fields: Description, Designator, Comment.
+  LibReference is reserved for Task Target.
   Fixed-format XML reader, no COM/MSXML.
   Clone full components via Replicate to preserve graphical modes and their names.
   Confirmed by user test in Altium Designer 26.6.0.
   XML attribute values must use double quotes.
+  Parameter Value is selectively decoded from UTF-8; XML structure is unchanged.
   Test on a BACKUP of the SchLib first.
 }
 
+
 const
-  XML_FILE = 'C:\Altium\clone_config.xml';
-  LIB_FILE = 'C:\Altium\Components.SchLib';
+  XML_FILE = 'C:\WDIR\PowerPass\clone_config.xml';
+  LIB_FILE = 'C:\WDIR\PowerPass\Library.SCHLIB';
+
 
 function PosEx(Needle, Haystack : String; Offset : Integer) : Integer;
 var
@@ -208,10 +213,11 @@ begin
   Comp.SchIterator_Destroy(It);
 end;
 
-procedure SetParameter(Comp : ISch_Component; Name, Value : String);
+function SetParameter(Comp : ISch_Component; Name, Value : String) : Boolean;
 var
   P : ISch_Parameter;
 begin
+  Result := False;
   P := FindParameter(Comp, Name);
   if P = Nil then
   begin
@@ -225,13 +231,140 @@ begin
   end
   else
     P.Text := Value;
+
+  { Verify through the component's iterator, not just the local object. }
+  P := FindParameter(Comp, Name);
+  if P <> Nil then
+    Result := (P.Text = Value);
 end;
 
-procedure ApplyParameters(Comp : ISch_Component; TaskBody : String);
+{ Built-in component fields must not be created as user parameters.
+  LibReference is controlled exclusively by Task Target. }
+function SetComponentField(Comp : ISch_Component;
+                           Name, Value : String) : Boolean;
+var
+  Key : String;
+begin
+  Result := False;
+  Key := UpperCase(Name);
+
+  if Key = 'DESCRIPTION' then
+  begin
+    Comp.ComponentDescription := Value;
+    Result := (Comp.ComponentDescription = Value);
+  end
+  else if Key = 'DESIGNATOR' then
+  begin
+    if Comp.Designator <> Nil then
+    begin
+      Comp.Designator.Text := Value;
+      Result := (Comp.Designator.Text = Value);
+    end;
+  end
+  else if Key = 'COMMENT' then
+  begin
+    if Comp.Comment <> Nil then
+    begin
+      Comp.Comment.Text := Value;
+      Result := (Comp.Comment.Text = Value);
+    end;
+  end;
+end;
+
+function IsProtectedField(Name : String) : Boolean;
+var
+  Key : String;
+begin
+  Key := UpperCase(Name);
+  Result := (Key = 'LIBREFERENCE') or (Key = 'PARTCOUNT') or
+            (Key = 'DISPLAYMODECOUNT') or (Key = 'DISPLAYMODE') or
+            (Key = 'CURRENTPARTID') or
+            (Key = 'CUSTOMDISPLAYMODENAME');
+end;
+
+{ Decode only Parameter Value, never the whole XML document.
+  If LoadFromFile has already produced Unicode, leave it untouched.
+  Validate UTF-8 byte sequences before calling UTF8Decode. }
+function DecodeParameterValueUtf8(S : String) : String;
+var
+  I, J, B, B2, N, CodePoint : Integer;
+  HasMultibyte, Valid : Boolean;
+begin
+  Result := S;
+  I := 1;
+  HasMultibyte := False;
+  Valid := True;
+  while I <= Length(S) do
+  begin
+    B := Ord(S[I]);
+    { Unicode code units mean the string is already decoded. }
+    if B > 255 then Exit;
+    if B < 128 then
+    begin
+      Inc(I);
+      Continue;
+    end;
+
+    if (B >= 194) and (B <= 223) then
+    begin
+      N := 2;
+      CodePoint := B - 192;
+    end
+    else if (B >= 224) and (B <= 239) then
+    begin
+      N := 3;
+      CodePoint := B - 224;
+    end
+    else if (B >= 240) and (B <= 244) then
+    begin
+      N := 4;
+      CodePoint := B - 240;
+    end
+    else
+    begin
+      Valid := False;
+      Break;
+    end;
+
+    if I + N - 1 > Length(S) then
+    begin
+      Valid := False;
+      Break;
+    end;
+    for J := 1 to N - 1 do
+    begin
+      B2 := Ord(S[I + J]);
+      if (B2 < 128) or (B2 > 191) then
+      begin
+        Valid := False;
+        Break;
+      end;
+      CodePoint := CodePoint * 64 + (B2 - 128);
+    end;
+    if not Valid then Break;
+    if ((N = 2) and (CodePoint < 128)) or
+       ((N = 3) and (CodePoint < 2048)) or
+       ((N = 4) and (CodePoint < 65536)) or
+       (CodePoint > 1114111) or
+       ((CodePoint >= 55296) and (CodePoint <= 57343)) then
+    begin
+      Valid := False;
+      Break;
+    end;
+    HasMultibyte := True;
+    Inc(I, N);
+  end;
+  if Valid and HasMultibyte then
+    Result := UTF8Decode(S);
+end;
+
+function ApplyParameters(Comp : ISch_Component; TaskBody : String;
+                         var Errors : String) : Integer;
 var
   P, E : Integer;
   Tag, Name, Value : String;
 begin
+  Result := 0;
   P := 1;
   while True do
   begin
@@ -242,7 +375,27 @@ begin
     Tag := Copy(TaskBody, P, E - P + 1);
     Name := TagAttribute(Tag, 'Name');
     Value := TagAttribute(Tag, 'Value');
-    if Name <> '' then SetParameter(Comp, Name, Value);
+    Value := DecodeParameterValueUtf8(Value);
+    if Name = '' then
+      Errors := Errors + 'Parameter without Name in ' + Comp.LibReference + #13#10
+    else if IsProtectedField(Name) then
+      Errors := Errors + 'Reserved component field (not changed): ' +
+                Comp.LibReference + ' / ' + Name + #13#10
+    else if (UpperCase(Name) = 'DESCRIPTION') or
+            (UpperCase(Name) = 'DESIGNATOR') or
+            (UpperCase(Name) = 'COMMENT') then
+    begin
+      if SetComponentField(Comp, Name, Value) then
+        Inc(Result)
+      else
+        Errors := Errors + 'Built-in field NOT applied: ' +
+                  Comp.LibReference + ' / ' + Name + #13#10;
+    end
+    else if SetParameter(Comp, Name, Value) then
+      Inc(Result)
+    else
+      Errors := Errors + 'Parameter NOT applied: ' + Comp.LibReference +
+                ' / ' + Name + #13#10;
     P := E + 1;
   end;
 end;
@@ -291,7 +444,7 @@ var
   Content, TaskTag, TaskBody : String;
   SourceName, TargetName, Errors : String;
   P, E, CloseP, PassNo : Integer;
-  Created, Modified, Skipped : Integer;
+  Created, Modified, Skipped, ParametersApplied, TaskParameters : Integer;
   Comp, NewComp : ISch_Component;
 begin
   if SchServer = Nil then
@@ -327,72 +480,87 @@ begin
   Modified := 0;
   Skipped := 0;
   Errors := '';
+  ParametersApplied := 0;
 
-  { Two passes: first clone, then edit original components. }
-  for PassNo := 1 to 2 do
-  begin
-    P := 1;
-    while True do
+  { Notify schematic server about the batch update. }
+  { This is experimental for SchLib in Altium Designer 26.6.0. }
+  SchServer.ProcessControl.PreProcess(Lib, '');
+  try
+    { Two passes: first clone, then edit original components. }
+    for PassNo := 1 to 2 do
     begin
-      P := FindNextTag(Content, 'Task', P);
-      if P = 0 then Break;
-      E := PosEx('>', Content, P);
-      if E = 0 then Break;
-      CloseP := PosEx('</Task>', Content, E + 1);
-      if CloseP = 0 then
+      P := 1;
+      while True do
       begin
-        Errors := Errors + 'Unclosed Task tag' + #13#10;
-        Break;
-      end;
+        P := FindNextTag(Content, 'Task', P);
+        if P = 0 then Break;
+        E := PosEx('>', Content, P);
+        if E = 0 then Break;
+        CloseP := PosEx('</Task>', Content, E + 1);
+        if CloseP = 0 then
+        begin
+          Errors := Errors + 'Unclosed Task tag' + #13#10;
+          Break;
+        end;
 
-      TaskTag := Copy(Content, P, E - P + 1);
-      TaskBody := Copy(Content, E + 1, CloseP - E - 1);
-      SourceName := TagAttribute(TaskTag, 'Source');
-      TargetName := TagAttribute(TaskTag, 'Target');
-      P := CloseP + Length('</Task>');
+        TaskTag := Copy(Content, P, E - P + 1);
+        TaskBody := Copy(Content, E + 1, CloseP - E - 1);
+        SourceName := TagAttribute(TaskTag, 'Source');
+        TargetName := TagAttribute(TaskTag, 'Target');
+        P := CloseP + Length('</Task>');
 
-      if (PassNo = 1) and (TargetName = '') then Continue;
-      if (PassNo = 2) and (TargetName <> '') then Continue;
+        if (PassNo = 1) and (TargetName = '') then Continue;
+        if (PassNo = 2) and (TargetName <> '') then Continue;
 
-      if SourceName = '' then
-      begin
-        Inc(Skipped);
-        Errors := Errors + 'Missing Source' + #13#10;
-        Continue;
-      end;
-
-      Comp := FindComponent(Lib, SourceName);
-      if Comp = Nil then
-      begin
-        Inc(Skipped);
-        Errors := Errors + 'Source not found: ' + SourceName + #13#10;
-        Continue;
-      end;
-
-      if TargetName <> '' then
-      begin
-        if FindComponent(Lib, TargetName) <> Nil then
+        if SourceName = '' then
         begin
           Inc(Skipped);
-          Errors := Errors + 'Target exists: ' + TargetName + #13#10;
+          Errors := Errors + 'Missing Source' + #13#10;
           Continue;
         end;
-        NewComp := CloneComponent(Lib, Comp, TargetName);
-        if NewComp = Nil then
+
+        Comp := FindComponent(Lib, SourceName);
+        if Comp = Nil then
         begin
           Inc(Skipped);
-          Errors := Errors + 'Clone failed: ' + TargetName + #13#10;
+          Errors := Errors + 'Source not found: ' + SourceName + #13#10;
           Continue;
         end;
-        ApplyParameters(NewComp, TaskBody);
-        Inc(Created);
-      end
-      else
-      begin
-        ApplyParameters(Comp, TaskBody);
-        Inc(Modified);
+
+        if TargetName <> '' then
+        begin
+          if FindComponent(Lib, TargetName) <> Nil then
+          begin
+            Inc(Skipped);
+            Errors := Errors + 'Target exists: ' + TargetName + #13#10;
+            Continue;
+          end;
+          NewComp := CloneComponent(Lib, Comp, TargetName);
+          if NewComp = Nil then
+          begin
+            Inc(Skipped);
+            Errors := Errors + 'Clone failed: ' + TargetName + #13#10;
+            Continue;
+          end;
+          TaskParameters := ApplyParameters(NewComp, TaskBody, Errors);
+          ParametersApplied := ParametersApplied + TaskParameters;
+          if (TaskParameters = 0) and (Pos('<Parameter', TaskBody) = 0) then
+            Errors := Errors + 'No Parameter tags in clone task: ' + TargetName + #13#10;
+          Inc(Created);
+        end
+        else
+        begin
+          TaskParameters := ApplyParameters(Comp, TaskBody, Errors);
+          ParametersApplied := ParametersApplied + TaskParameters;
+          if (TaskParameters = 0) and (Pos('<Parameter', TaskBody) = 0) then
+            Errors := Errors + 'No Parameter tags in edit task: ' + SourceName + #13#10;
+          Inc(Modified);
+        end;
       end;
     end;
+
+  finally
+    SchServer.ProcessControl.PostProcess(Lib, '');
   end;
 
   Lib.GraphicallyInvalidate;
@@ -400,5 +568,6 @@ begin
               'Created: ' + IntToStr(Created) + #13#10 +
               'Modified: ' + IntToStr(Modified) + #13#10 +
               'Skipped: ' + IntToStr(Skipped) + #13#10 +
+              'Parameters applied: ' + IntToStr(ParametersApplied) + #13#10 +
               Errors);
 end;
