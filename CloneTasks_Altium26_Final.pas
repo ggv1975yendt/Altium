@@ -12,8 +12,8 @@
 
 
 const
-  XML_FILE = 'C:\WDIR\PowerPass\clone_config.xml';
-  LIB_FILE = 'C:\WDIR\PowerPass\Library.SCHLIB';
+  XML_FILE = 'clone_config.xml';
+  LIB_FILE = 'Library.SCHLIB';
 
 
 function PosEx(Needle, Haystack : String; Offset : Integer) : Integer;
