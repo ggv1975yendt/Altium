@@ -9,8 +9,8 @@
   No replacement limit. Aborts if any project SchDoc is not loaded. XML Task Source/Target attributes.
 }
 const
-  XML_FILE = 'C:\Altium\clone_config.xml';
-  LIB_FILE = 'C:\WDIR\PowerPass\DTER.301411.003 (Altium)\1. SCH\Library\Library.SCHLIB';
+  XML_FILE = 'clone_config.xml';
+  LIB_FILE = 'Library.SCHLIB';
 
 function XMLAttr(const Tag, Attr: String): String;
 var K,P,Q: Integer; Needle: String;
